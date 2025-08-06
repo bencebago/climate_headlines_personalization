@@ -1,0 +1,507 @@
+---
+title: "Personalization"
+output: html_notebook
+---
+
+```{r library}
+library(tidyverse)
+library(jsonlite)
+library(httr)
+
+
+```
+
+
+```{r management}
+
+
+# Read the CSV file with the appropriate delimiter
+
+df <- read.csv("anonim_df_pretest.csv", sep=",", header = TRUE, encoding='UTF-8')
+
+# Extract relevant columns
+ratings_columns <- grep("^Rating", colnames(df), value = TRUE)
+statement_columns <- grep("^statementText", colnames(df), value = TRUE)
+prolific_id_column <- "porlific"
+
+# Function to parse JSON ratings
+parse_ratings <- function(rating_str) {
+  if (is.na(rating_str) || rating_str == "") return(NULL)
+  rating <- tryCatch(fromJSON(gsub('""', '"', gsub('""', '"', rating_str))), error = function(e) NULL)
+  return(rating)
+}
+
+
+# Flatten the ratings columns
+ratings_data <- df %>%
+  select(all_of(ratings_columns)) %>%
+  mutate(across(everything(), ~ map(.x, parse_ratings)))
+
+# Convert to long format
+long_format_data <- list()
+
+for (i in 1:nrow(df)) {
+  prolific_id <- df[i, prolific_id_column]
+  for (j in 1:length(statement_columns)) {
+    statement_text <- df[i, statement_columns[j]]
+    rating <- ratings_data[[ratings_columns[j]]][[i]]
+    if (!is.null(rating)) {
+      long_format_data[[length(long_format_data) + 1]] <- tibble(
+        statementText = statement_text,
+        ProlificID = prolific_id,
+        positive_rating = as.numeric(rating$positive),
+        negative_rating = as.numeric(rating$negative),
+        regret_rating = as.numeric(rating$regret),
+        agreement_rating = as.numeric(rating$agreement)
+      )
+    }
+  }
+}
+
+# Combine the list of tibbles into a single dataframe
+long_format_df <- bind_rows(long_format_data)
+
+additional_columns <- c("Educational.Level", "DemRep_C", "Ideology_econ", "Ideology_social", "AttentionCheck2", "climate1", "climate2")
+
+additional_info_df <- df %>%
+  select(all_of(prolific_id_column), all_of(additional_columns)) %>%
+  distinct() %>%
+  rename(ProlificID = all_of(prolific_id_column))
+
+# Merge based on ProlificID
+final_df <- long_format_df %>%
+  left_join(additional_info_df, by = "ProlificID")
+
+
+
+# URL of the JSON file on GitHub
+json_url <- "https://raw.githubusercontent.com/bencebago/news_personalization/main/filtered_relevant_articles_science.json"
+
+json_data <- fromJSON(content(GET(json_url), "text", encoding = "UTF-8"))
+
+# Function to find the entry containing the statement
+find_column <- function(statement, df) {
+  for (col_name in colnames(df)) {
+    entry <- df[[col_name]]
+    if (statement %in% entry) {
+      return(col_name)
+    }
+  }
+  return(NA)
+}
+
+find_row <- function(statement, df) {
+  for (i in seq_len(nrow(df))) {
+    if (statement %in% df[i, ]) {
+      return(i)
+    }
+  }
+  return(NA)
+}
+
+
+# Apply the function to each statementText in the long_format_df
+final_df <- final_df %>%
+  mutate(entry_name = map_chr(statementText, ~ find_column(.x, json_data)),
+         item_nr =  map_int(statementText, ~ find_row(.x, json_data)))
+
+
+
+```
+
+```{r correlations}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+#final_df <- final_df %>%
+#  mutate(regret_rating = regret_rating * -1,
+ #        positive_rating = positive_rating * -1)
+
+# Function to calculate correlation matrix
+calc_correlations <- function(data) {
+  data <- data %>% select(agreement_rating, regret_rating)
+  numeric_data <- data %>% mutate(across(everything(), as.numeric))
+  cor_matrix <- cor(numeric_data, use = "complete.obs")
+  return(cor_matrix)
+}
+
+# Filter, group by climate2, and calculate correlations
+correlation_tables <- final_df %>%
+  filter(climate2 %in% c("Caused mostly by natural changes in the environment", 
+                         "None of the above because global warming isn’t happening")) %>%
+  group_by(climate2, entry_name) %>%
+  summarise(cor_matrix = list(calc_correlations(cur_data())),
+            .groups = 'drop')
+
+# Convert list column to separate data frames for each climate2
+correlation_tables_list <- correlation_tables %>%
+  mutate(cor_matrix = map(cor_matrix, ~ as.data.frame(as.table(.)))) %>%
+  unnest(cor_matrix)
+
+correlation_tables_list <- correlation_tables_list %>%
+  filter(as.character(Var1) < as.character(Var2))
+
+# Display the correlation tables
+print(correlation_tables_list)
+
+cor(count_negatives$OriginDenier_agreement_distance, count_negatives$OriginDenier_regret_distance)
+cor(count_negatives$AbsoluteDenier_agreement_distance, count_negatives$AbsoluteDenier_regret_distance)
+
+count_negatives$regret_or_agreement_Absolute = ifelse(count_negatives$AbsoluteDenier_regret_distance < 0 | count_negatives$AbsoluteDenier_agreement_distance < 0, 1,0)
+count_negatives$regret_or_agreement_Origin = ifelse(count_negatives$OriginDenier_regret_distance < 0 | count_negatives$OriginDenier_agreement_distance < 0, 1,0)
+
+sum(count_negatives[count_negatives$climate2=="Caused mostly by natural changes in the environment",]$regret_or_agreement_Absolute)
+sum(count_negatives[count_negatives$climate2=="None of the above because global warming isn’t happening",]$regret_or_agreement_Absolute)
+
+sum(count_negatives[count_negatives$climate2=="Caused mostly by natural changes in the environment",]$regret_or_agreement_Origin)
+sum(count_negatives[count_negatives$climate2=="None of the above because global warming isn’t happening",]$regret_or_agreement_Origin)
+
+```
+
+```{r figures}
+
+####need to exclude items which failed pretest and need to exclude items that failed fact-checking
+
+
+
+library(ggplot2)
+
+figuredata = final_df %>%
+  mutate(entry_name = factor(entry_name, labels = c('Flipped', 'OriginDenier', 'Original')))#%>%
+  filter(entry_name!='OriginDenier')
+
+summary_data <- figuredata %>%
+  group_by(entry_name) %>%
+  summarize(
+    mean_agreement = mean(agreement_rating, na.rm = TRUE),
+    se_agreement = sd(agreement_rating, na.rm = TRUE) / sqrt(n())
+  )
+
+
+ggplot(summary_data, aes(x = entry_name, y = mean_agreement)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_agreement - se_agreement, ymax = mean_agreement + se_agreement), width = 0.2) +
+  labs(x = "Headline type", y = "Anticipated agreement", title = "Mean Anticipated Agreement Rating") +
+  theme_minimal()
+
+
+#regret
+summary_data <- figuredata %>%
+  group_by(entry_name) %>%
+  summarize(
+    mean_agreement = mean(regret_rating, na.rm = TRUE),
+    se_agreement = sd(regret_rating, na.rm = TRUE) / sqrt(n())
+  )
+
+
+ggplot(summary_data, aes(x = entry_name, y = mean_agreement)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_agreement - se_agreement, ymax = mean_agreement + se_agreement), width = 0.2) +
+  labs(x = "Headline type", y = "Anticipated regret", title = "Mean Anticipated Regret Rating") +
+  theme_minimal()
+
+
+#positive emotions
+summary_data <- figuredata %>%
+  group_by(entry_name) %>%
+  summarize(
+    mean_agreement = mean(positive_rating, na.rm = TRUE),
+    se_agreement = sd(positive_rating, na.rm = TRUE) / sqrt(n())
+  )
+
+
+ggplot(summary_data, aes(x = entry_name, y = mean_agreement)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_agreement - se_agreement, ymax = mean_agreement + se_agreement), width = 0.2) +
+  labs(x = "Headline type", y = "Positive emotions", title = "Mean Positive Emotions Rating by Headline Type with Standard Errors") +
+  theme_minimal()
+
+
+
+#negative emotions
+summary_data <- figuredata %>%
+  group_by(entry_name) %>%
+  summarize(
+    mean_agreement = mean(negative_rating, na.rm = TRUE),
+    se_agreement = sd(negative_rating, na.rm = TRUE) / sqrt(n())
+  )
+
+
+ggplot(summary_data, aes(x = entry_name, y = mean_agreement)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_agreement - se_agreement, ymax = mean_agreement + se_agreement), width = 0.2) +
+  labs(x = "Headline type", y = "Negative emotions", title = "Mean Negative Emotions Rating by Headline Type with Standard Errors") +
+  theme_minimal()
+
+
+
+```
+
+```{r regression}
+library(lmerTest)
+
+final_df = final_df %>%
+  mutate(absoluteheadline = ifelse(entry_name =='selected_title_AbsoluteDenier',1,0),
+         originheadline = ifelse(entry_name =='selected_title_OriginDenier',1,0))%>%
+  filter(climate2 == "Caused mostly by natural changes in the environment" | 
+         climate2 == "None of the above because global warming isn’t happening")
+
+model1 = lmer(scale(agreement_rating) ~ absoluteheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_OriginDenier',], na.action=na.omit)
+summary(model1)
+
+model1 = lmer(scale(regret_rating) ~ absoluteheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_OriginDenier',], na.action=na.omit)
+summary(model1)
+
+
+model1 = lmer(scale(positive_rating) ~ absoluteheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_OriginDenier',], na.action=na.omit)
+summary(model1)
+
+
+model1 = lmer(scale(negative_rating) ~ absoluteheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_OriginDenier',], na.action=na.omit)
+summary(model1)
+
+
+
+####originheadlines
+model1 = lmer(agreement_rating ~ originheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_AbsoluteDenier',], na.action=na.omit)
+summary(model1)
+
+model1 = lmer(regret_rating ~ originheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_AbsoluteDenier',], na.action=na.omit)
+summary(model1)
+
+
+model1 = lmer(positive_rating ~ originheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_AbsoluteDenier',], na.action=na.omit)
+summary(model1)
+
+
+model1 = lmer(negative_rating ~ originheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_AbsoluteDenier',], na.action=na.omit)
+summary(model1)
+```
+
+```{r demographics}
+
+demdata=read.csv('prolific_export_66605ab74751a7906966f7c0.csv', header=T)
+
+df2 = df %>%
+  left_join(demdata, by=c('porlific' = 'Participant.id'))
+table(df2$Sex)
+
+mean(as.numeric(df2$Age), na.rm=T)
+sd(as.numeric(df2$Age), na.rm=T)
+
+
+```
+
+```{r item selection based on manipulation check}
+
+
+
+
+byItem <- final_df %>%
+  #mutate(regret_rating = regret_rating * -1) %>%
+  filter(climate2 == "Caused mostly by natural changes in the environment" | 
+         climate2 == "None of the above because global warming isn’t happening") %>%
+  group_by(item_nr, entry_name) %>%
+  summarize(mean_regret = mean(regret_rating, na.rm = TRUE),
+            mean_agreement = mean(agreement_rating, na.rm = TRUE),
+            mean_positive = mean(positive_rating, na.rm = TRUE),
+            mean_negative = mean(negative_rating, na.rm = TRUE)*-1,
+            .groups = 'drop')
+
+wide_data <- byItem %>%
+  pivot_wider(names_from = entry_name, 
+              values_from = c(mean_regret, mean_agreement, mean_positive, mean_negative),
+              names_sep = "_",
+              id_cols = c(item_nr))%>%
+  mutate(original = mean_regret_title + mean_agreement_title + mean_positive_title + mean_negative_title,
+         AbsoluteDenier = mean_regret_selected_title_AbsoluteDenier + mean_agreement_selected_title_AbsoluteDenier + mean_negative_selected_title_AbsoluteDenier + mean_positive_selected_title_AbsoluteDenier,
+         OriginDenier = mean_regret_selected_title_AbsoluteDenier + mean_agreement_selected_title_AbsoluteDenier + mean_negative_selected_title_AbsoluteDenier + mean_positive_selected_title_AbsoluteDenier,
+         absolutedenier_works = ifelse(AbsoluteDenier > original, 1,0))
+
+sum(wide_data$absolutedenier_works)
+#save item_nr of items to a vector in which absolutedenier_works is 1. 
+
+items_absolutedenier_works <- wide_data %>%
+  filter(absolutedenier_works == 1) %>%
+  pull(item_nr)
+
+
+
+diff_data <- wide_data %>%
+  mutate(OriginDenier_regret_distance = mean_regret_title - mean_regret_selected_title_OriginDenier,
+         OriginDenier_agreement_distance = mean_agreement_title - mean_agreement_selected_title_OriginDenier,
+         OriginDenier_positive_distance = mean_positive_title - mean_positive_selected_title_OriginDenier,
+         OriginDenier_negative_distance = mean_negative_title - mean_negative_selected_title_OriginDenier,
+         AbsoluteDenier_regret_distance = mean_regret_title - mean_regret_selected_title_AbsoluteDenier,
+         AbsoluteDenier_agreement_distance = mean_agreement_title - mean_agreement_selected_title_AbsoluteDenier,
+         AbsoluteDenier_positive_distance = mean_positive_title - mean_positive_selected_title_AbsoluteDenier,
+         AbsoluteDenier_negative_distance = mean_negative_title - mean_negative_selected_title_AbsoluteDenier,
+         agreement_absolute= ifelse(AbsoluteDenier_agreement_distance < 0,1,0))
+         
+sum(diff_data$agreement_absolute)
+#save the item_nrs
+
+write.csv(diff_data, file = 'diff_data.csv', row.names = FALSE)
+
+
+
+```
+
+```{r item selection based on fact-check}
+
+# Load necessary libraries
+library(readxl)
+library(dplyr)
+library(stringdist)
+
+# Load the final_df and response_factchecker dataframes
+response_factchecker <- read_excel("response_factcheck.xlsx")
+
+# Ensure the relevant columns are character type for accurate merging
+final_df <- final_df %>%
+  mutate(statementText = as.character(statementText))
+
+response_factchecker <- response_factchecker %>%
+  mutate(title = as.character(title))
+
+# Normalize text function
+normalize_text <- function(text) {
+  text <- tolower(text)                    # Convert to lower case
+  text <- gsub("[[:punct:]]", "", text)    # Remove punctuation
+  text <- trimws(text)                     # Trim whitespace
+  return(text)
+}
+
+# Apply normalization
+final_df <- final_df %>%
+  mutate(statementText_normalized = normalize_text(statementText))
+
+response_factchecker <- response_factchecker %>%
+  mutate(title_normalized = normalize_text(title))
+
+# Merge the dataframes based on the normalized columns
+merged_df <- response_factchecker %>%
+  left_join(final_df %>% select(statementText, item_nr, statementText_normalized), by = c("title_normalized" = "statementText_normalized"))
+
+# Identify unmatched titles
+unmatched_titles <- merged_df %>%
+  filter(is.na(item_nr)) %>%
+  select(title) %>%
+  distinct()
+
+print("Unmatched Titles:")
+print(unmatched_titles$title)
+
+# Fuzzy matching for unmatched titles
+unmatched_titles <- unmatched_titles %>%
+  mutate(title_normalized = normalize_text(title))
+
+final_df_normalized <- final_df %>%
+  select(statementText, item_nr, statementText_normalized)
+
+fuzzy_match_results <- lapply(unmatched_titles$title_normalized, function(x) {
+  distances <- stringdist::stringdist(x, final_df_normalized$statementText_normalized, method = "jw")
+  min_index <- which.min(distances)
+  return(final_df_normalized[min_index, c("statementText", "item_nr")])
+})
+
+# Combine fuzzy match results
+fuzzy_match_df <- do.call(rbind, fuzzy_match_results)
+
+# Merge fuzzy matched results back to the original data
+unmatched_titles <- unmatched_titles %>%
+  bind_cols(fuzzy_match_df)
+
+# Merge the fuzzy matched results back to the original merged_df
+merged_df <- merged_df %>%
+  left_join(unmatched_titles %>% select(title, statementText_fuzzy = statementText, item_nr_fuzzy = item_nr), by = "title") %>%
+  mutate(
+    item_nr = ifelse(is.na(item_nr), item_nr_fuzzy, item_nr),
+    statementText = ifelse(is.na(statementText), statementText_fuzzy, statementText)
+  ) %>%
+  select(-statementText_fuzzy, -item_nr_fuzzy)
+
+# Proceed with the rest of your filtering and analysis steps as before
+merged_df_distinct <- merged_df %>%
+  distinct()
+
+# Identify excluded statementText due to relevance filter
+excluded_by_relevance <- merged_df_distinct %>%
+  filter(relevance <= 3 | is.na(relevance)) %>%
+  select(title)
+
+# Filter merged_df_distinct for item_nr with relevance greater than 2
+filtered_item_nr <- merged_df_distinct %>%
+  filter(relevance > 3 & !is.na(relevance)) %>%
+  pull(item_nr)
+
+# Combine items_absolutedenier_works with filtered_item_nr
+final_item_nr_list <- intersect(items_absolutedenier_works, filtered_item_nr)
+
+# Identify excluded statementText due to final_item_nr_list filter
+excluded_by_item_nr_list <- final_df %>%
+  filter(entry_name=='selected_title_AbsoluteDenier')%>%
+  filter(!(item_nr %in% items_absolutedenier_works)) 
+
+# Filter final_df based on the combined list of item_nr
+filtered_final_df <- final_df %>%
+  filter(item_nr %in% final_item_nr_list)
+
+# Calculate the number of unique item_nr in the filtered final_df
+num_unique_item_nr <- filtered_final_df %>%
+  summarise(unique_item_nr_count = n_distinct(item_nr)) %>%
+  pull(unique_item_nr_count)
+
+# Print the values of statementText being excluded at each step
+print("Excluded due to relevance filter:")
+print(excluded_by_relevance$title)
+
+print("Excluded due to failed manipulation check filter:")
+print(levels(factor(excluded_by_item_nr_list$statementText)))
+
+
+print("Excluded due to relevance filter:")
+print(length(excluded_by_relevance$title))
+
+print("Excluded due to failed manipulation check filter:")
+print(length(levels(factor(excluded_by_item_nr_list$statementText))))
+
+# Print the number of unique item_nr in the filtered final_df
+print(paste("Number of unique item_nr in the filtered final_df:", num_unique_item_nr))
+
+writeLines(as.character(final_item_nr_list), "included_item_nrs.txt")
+
+item1 = final_df%>%
+  filter(item_nr==1& entry_name == 'selected_title_AbsoluteDenier')%>%
+  select(statementText)
+
+figuredata = filtered_final_df %>%
+  mutate(entry_name = factor(entry_name, labels = c('AbsoluteDenier', 'OriginDenier', 'Original')))
+
+summary_data <- figuredata %>%
+  group_by(entry_name) %>%
+  summarize(
+    mean_agreement = mean(agreement_rating, na.rm = TRUE),
+    se_agreement = sd(agreement_rating, na.rm = TRUE) / sqrt(n())
+  )
+
+
+ggplot(summary_data, aes(x = entry_name, y = mean_agreement)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_agreement - se_agreement, ymax = mean_agreement + se_agreement), width = 0.2) +
+  labs(x = "Headline type", y = "Anticipated agreement", title = "Mean Agreement Rating by Headline Type with Standard Errors") +
+  theme_minimal()
+
+final_df = filtered_final_df %>%
+  mutate(absoluteheadline = ifelse(entry_name =='selected_title_AbsoluteDenier',1,0),
+         originheadline = ifelse(entry_name =='selected_title_OriginDenier',1,0))%>%
+  filter(climate2 == "Caused mostly by natural changes in the environment" | 
+         climate2 == "None of the above because global warming isn’t happening")
+
+model1 = lmer(agreement_rating ~ absoluteheadline + (1|ProlificID) + (1|item_nr), data = final_df[final_df$entry_name!='selected_title_OriginDenier',], na.action=na.omit)
+summary(model1)
+
+
+```
